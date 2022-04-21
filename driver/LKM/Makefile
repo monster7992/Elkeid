@@ -43,6 +43,12 @@ ifneq ($(IPV6_SUPPORT),)
 ccflags-y += -D IPV6_SUPPORT
 endif
 
+UACCESS_FILES := $(shell find -L $(K_I_PATH) -path \*/asm-generic/uaccess.h) /dev/null
+UACCESS_SUPPORT := $(shell sh -c "grep -sE define[[:space:]]\+access_ok $(UACCESS_FILES) | grep type")
+ifneq ($(UACCESS_SUPPORT),)
+ccflags-y += -D UACCESS_TYPE_SUPPORT
+endif
+
 TRACE_EVENTS_HEADERS	:= $(shell find -L $(K_I_PATH) -path \*/linux/trace_events.h)
 ifneq ($(TRACE_EVENTS_HEADERS),)
 ccflags-y += -D SMITH_TRACE_EVENTS
