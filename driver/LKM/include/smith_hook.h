@@ -122,6 +122,7 @@ void smith_enum_img(void);
 /*
  * per-task record, managed by hash-list
  */
+#define TASK_MNTID_LEN (32)
 struct smith_tid {
     struct hlist_hnod   st_node;
     uint64_t            st_start;   /* start time of current task */
@@ -129,7 +130,7 @@ struct smith_tid {
     uint32_t            st_sid;     /* session id (when being created) */
     char               *st_pid_tree;/* pid tree strings */
     struct smith_img   *st_img;     /* cache of exe path */
-    char                st_comm[TASK_COMM_LEN];
+    char                st_mnt[TASK_MNTID_LEN]; /* mount id */
 };
 
 static inline uint64_t smith_task_start_time(struct task_struct *task) {

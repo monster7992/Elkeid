@@ -59,6 +59,18 @@ ifneq ($(TRACE_SEQ_SEQ),)
 ccflags-y += -D SMITH_TRACE_SEQ
 endif
 
+FS_MOUNT_FILES := $(shell find -L $(K_I_PATH) -path \*/linux/mount.h) /dev/null
+FS_MOUNT_STRUCT := $(shell sh -c "grep -s \*mnt_mountpoint $(FS_MOUNT_FILES)")
+ifneq ($(FS_MOUNT_STRUCT),)
+ccflags-y += -D KERNEL_HAVE_FS_MOUNT
+endif
+
+SBOP_OPT_FILES := $(shell find -L $(K_I_PATH) -path \*/linux/fs.h) /dev/null
+SBOP_OPT_VFSMNT := $(shell sh -c "grep -s \*show_options $(SBOP_OPT_FILES) | grep vfsmount")
+ifneq ($(SBOP_OPT_VFSMNT),)
+ccflags-y += -D SB_OPTIONS_VFSMNT
+endif
+
 else
 
 MODULE_DIR		:= $(shell pwd)

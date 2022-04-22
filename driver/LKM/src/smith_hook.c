@@ -6,9 +6,12 @@
  */
 #include "../include/smith_hook.h"
 
+/* mount_ns and pid_ns id for systemd process */
+static void *ROOT_MNT_NS;
+static void *ROOT_MNT_SB;
+static unsigned int ROOT_PID_NS_INUM;
 
 #define __SD_XFER_SE__
-static unsigned int ROOT_PID_NS_INUM;
 #include "../include/xfer.h"
 #include "../include/kprobe_print.h"
 
@@ -1206,6 +1209,7 @@ int execve_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
                      tmp_stdin, tmp_stdout,
                      dip4, dport, sip4, sport,
                      pid_tree, tty_name, socket_pid,
+                     tid ? tid->st_mnt : NULL,
                      data->ssh_connection, data->ld_preload,
                      rc);
     }
@@ -1216,6 +1220,7 @@ int execve_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 			      tmp_stdin, tmp_stdout,
 			      &dip6, dport, &sip6, sport,
 			      pid_tree, tty_name, socket_pid,
+			      tid ? tid->st_mnt : NULL,
 			      data->ssh_connection, data->ld_preload,
 			      rc);
 	}
@@ -1225,7 +1230,9 @@ int execve_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
                               exe_path, data->argv,
                               tmp_stdin, tmp_stdout,
                               pid_tree, tty_name,
-                              data->ssh_connection, data->ld_preload,
+                              tid ? tid->st_mnt : NULL,
+                              data->ssh_connection,
+                              data->ld_preload,
                               rc);
     }
 
@@ -5187,38 +5194,263 @@ out:
     return tree;
 }
 
-static void smith_update_pid_tree(char *pid_tree, char *comm_old, char *comm_new)
+static void smith_update_pid_tree(char *pid_tree, char *comm_new)
 {
-    char *s;
-    int o, n;
+    char *s = NULL;
+    int o = 0, i = 1, n;
 
     if (!pid_tree)
         return;
-    s = strstr(pid_tree, comm_old);
+
+    /* locate 1st '.' in pid-tree */
+    while (!s && pid_tree[i]) {
+        if (pid_tree[i++] == '.')
+            s = &pid_tree[i];
+    }
     if (!s)
         return;
-    o = strlen(comm_old);
+    while (s[++o] != '<' && s[o]);
+
     n = strlen(comm_new);
-    if (o == n && !strcmp(comm_old, comm_new))
-        return;
-    if (o != n)
-        memmove(s + n, s + o, strlen(pid_tree) - o - (int)(s - pid_tree) + 1 /* ending 0 */);
+    if (o != n) {
+        int l = strlen(pid_tree) - o - (int)(s - pid_tree);
+        memmove(s + n, s + o, l + 1); /* extra tailing 0 */
+    }
     memcpy(s, comm_new, n);
 }
 
-static int smith_build_tid(struct smith_tid *tid, struct task_struct *task)
+static inline int smith_is_hex(char c)
+{
+    return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+            (c >= 'a' && c <= 'f') || (c == '-'));
+}
+
+static char *smith_query_uuid(char *s, int sl, char *t, int tl)
+{
+    char *longest = NULL, *hex = NULL;
+    int n = 0, i = 0, l = 0;
+
+    while (i < sl) {
+        if (smith_is_hex(s[i])) {
+            if (NULL == hex) {
+                hex = &s[i];
+            }
+            if (hex + n == &s[i]) {
+                n++;
+            }
+        } else {
+            if (n > l) {
+                longest = hex;
+                l = n;
+            }
+            hex = NULL;
+            n = 0;
+        }
+        i++;
+    }
+
+    if (!longest)
+        return NULL;
+
+    for (i = 0, n = 0; i < l; i++) {
+        if (longest[i] == '-')
+            continue;
+        t[n++] = longest[i];
+        if (n >= tl)
+            break;
+    }
+    /* buffer t always has space for extra trailing 0 */
+    t[n] = 0;
+
+    return longest;
+}
+
+#include <linux/mount.h>
+
+/* from v3.3 struct mount moved to fs/mount.h, no longer visible to modules */
+#ifdef KERNEL_HAVE_FS_MOUNT
+
+static int smith_query_mnt(struct path *root, char *mnt, int len)
+{
+    struct vfsmount *m = root->mnt;
+    struct dentry *de;
+    char *s = NULL, *n;
+    int rc = 0, sz;
+
+    if (!m)
+        return -EINVAL;
+
+    if (m->mnt_master) {
+        de = m->mnt_master->mnt_mountpoint;
+    } else {
+        de = m->mnt_mountpoint;
+    }
+    if (IS_ROOT(de))
+        return -ECHILD;
+
+    s =  smith_kmalloc(PAGE_SIZE, GFP_ATOMIC);
+    if (!s)
+        return -ENOMEM;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+    n = dentry_path_raw(de, s, PAGE_SIZE);
+#else
+    n = __dentry_path(de, s, PAGE_SIZE);
+#endif
+    if (!n) {
+        rc = -ENOENT;
+        goto errorout;
+    }
+
+    sz = PAGE_SIZE - 1 - (int)(n - s);
+    if (!smith_query_uuid(n, sz, mnt, len)) {
+        rc = -ENOENT;
+        goto errorout;
+    }
+
+errorout:
+    if (s)
+        smith_kfree(s);
+
+    return rc;
+}
+
+void smith_build_mnt(struct smith_tid *tid, struct task_struct *task)
+{
+    struct super_block *sb;
+    struct nsproxy *nsp;
+    struct path root;
+
+    task_lock(task);
+    root = task->fs->root;
+    nsp = task->nsproxy;
+    task_unlock(task);
+
+    sb = root.mnt ? root.mnt->mnt_sb : NULL;
+    if (sb && sb != ROOT_MNT_SB &&
+        !smith_query_mnt(&root, tid->st_mnt, TASK_MNTID_LEN / 2)) {
+    } else if (sb) {
+        if (nsp && nsp->uts_ns)
+            strlcpy(tid->st_mnt, nsp->uts_ns->name.nodename,
+                    TASK_MNTID_LEN);
+        else
+            snprintf(tid->st_mnt, TASK_MNTID_LEN, "(host)");
+    } else {
+        strncpy(tid->st_mnt, "(host)", TASK_MNTID_LEN - 1);
+    }
+
+    /* append the hex string of superblock pointer */
+    if (sb) {
+        unsigned long v = (unsigned long)sb;
+        int l = strlen(tid->st_mnt);
+        /* clear prefix 0xff */
+        v = v << 8;
+        v = v >> 8;
+        if (TASK_MNTID_LEN > l + 2)
+            snprintf(&tid->st_mnt[l], TASK_MNTID_LEN - l, "-%lx", v);
+    }
+
+    return;
+}
+
+#else /* KERNEL_HAVE_FS_MOUNT */
+
+int smith_build_mnt(struct smith_tid *tid, struct task_struct *task)
+{
+    struct nsproxy *nsp;
+    struct super_block *sb = NULL;
+    struct path root;
+    struct seq_file seq = {0};
+    char *s = NULL, *w;
+    int rc = -ENOENT;
+
+    task_lock(task);
+    nsp = task->nsproxy;
+    root = task->fs->root;
+    task_unlock(task);
+
+    sb = root.mnt ? root.mnt->mnt_sb : NULL;
+    if (!sb)
+	    goto errorout;
+
+    /* validate sb and overlayfs */
+    if (strcmp(sb->s_id, "overlay"))
+        goto errorout;
+    if (!sb->s_op->show_options)
+        goto errorout;
+#ifndef SB_OPTIONS_VFSMNT
+    if (sb != root.dentry->d_sb)
+        goto errorout;
+#endif
+
+    /* fake a seq_file only for overlay/ovl_show_options */
+    s =  smith_kmalloc(PAGE_SIZE, GFP_ATOMIC);
+    if (!s)
+        goto errorout;
+    seq.buf = s;
+    seq.size = PAGE_SIZE;
+#ifdef SB_OPTIONS_VFSMNT
+    rc = sb->s_op->show_options(&seq, root.mnt);
+#else
+    rc = sb->s_op->show_options(&seq, root.dentry);
+#endif
+    seq.buf = NULL;
+    if (rc)
+        goto errorout;
+
+    /* microk8s has different naming policies, so it's workdir and root
+       mountpoint are using differenct ids */
+    w = strstr(s, "workdir=");
+    if (!w)
+        goto errorout;
+    rc = !smith_query_uuid(w, PAGE_SIZE - 1 - (int)(w - s),
+                           tid->st_mnt, TASK_MNTID_LEN / 2);
+errorout:
+
+    if (s)
+        smith_kfree(s);
+
+    /* using nodename if we failed to query container namesapce uuid */
+    if (rc) {
+        if (sb) {
+            if (nsp && nsp->uts_ns)
+                strlcpy(tid->st_mnt, nsp->uts_ns->name.nodename,
+                        TASK_MNTID_LEN);
+            else
+                snprintf(tid->st_mnt, TASK_MNTID_LEN, "(host)");
+        } else {
+            strncpy(tid->st_mnt, "(host)", TASK_MNTID_LEN - 1);
+        }
+    }
+
+    /* append the hex string of superblock pointer */
+    if (sb) {
+        unsigned long v = (unsigned long)sb;
+        int l = strlen(tid->st_mnt);
+        /* clear prefix 0xff */
+        v = v << 8;
+        v = v >> 8;
+        if (TASK_MNTID_LEN > l + 2)
+            snprintf(&tid->st_mnt[l], TASK_MNTID_LEN - l, "-%lx", v);
+    }
+
+    return 0;
+}
+
+#endif /* KERNEL_HAVE_FS_MOUNT */
+
+int smith_build_tid(struct smith_tid *tid, struct task_struct *task)
 {
     tid->st_start = smith_task_start_time(task);
     tid->st_pid = task->pid;
     /* flags was already inited during allocation */
     tid->st_node.flag_newsid = smith_is_anchor(task->parent);
     tid->st_sid = task_session_nr_ns(task, &init_pid_ns);
-    memcpy(tid->st_comm, task->comm, TASK_COMM_LEN);
     tid->st_img = smith_find_img(task);
     if (!tid->st_img)
         return -ENOMEM;
     tid->st_pid_tree = smith_get_pid_tree(task);
-
+    smith_build_mnt(tid, task);
     return 0;
 }
 
@@ -5278,9 +5510,9 @@ static void smith_show_tid(struct hlist_hnod *hnod)
         return;
 
     tid = container_of(hnod, struct smith_tid, st_node);
-    printk("task: %s refs: %d pid: %u sid: %u\n",
-            tid->st_comm, atomic_read(&tid->st_node.refs),
-            tid->st_pid, tid->st_sid);
+    printk("pid: %u sid: %u task: %s mnt: %s refs: %d\n",
+            tid->st_pid, tid->st_sid, tid->st_pid_tree,
+            tid->st_mnt, atomic_read(&tid->st_node.refs));
 }
 
 void smith_enum_tid(void)
@@ -5354,8 +5586,9 @@ static void smith_trace_proc_exec(
     tid = smith_lookup_tid(task);
     if (!tid)
         goto errorout;
-    smith_update_pid_tree(tid->st_pid_tree, tid->st_comm, task->comm);
-    memcpy(tid->st_comm, task->comm, TASK_COMM_LEN);
+
+    /* update pid tree strings */
+    smith_update_pid_tree(tid->st_pid_tree, task->comm);
 
     /* build img for execed task */
     exe = smith_find_img(task);
@@ -5532,9 +5765,11 @@ static void smith_tid_fini(void)
     tt_rb_fini(&g_rb_img);
 }
 
-static inline void __init_root_pid_ns_inum(void) {
+static void __init smith_init_systemd_ns(void)
+{
     struct pid *pid_struct;
     struct task_struct *task;
+    struct path root;
 
     pid_struct = find_get_pid(1);
     task = pid_task(pid_struct,PIDTYPE_PID);
@@ -5554,6 +5789,12 @@ static inline void __init_root_pid_ns_inum(void) {
      */
     ROOT_PID_NS_INUM = 0xEFFFFFFCU /* PROC_PID_INIT_INO */;
 #endif
+
+    root = task->fs->root;
+    if (root.mnt)
+        ROOT_MNT_SB = root.mnt->mnt_sb;
+    if (task->nsproxy)
+        ROOT_MNT_NS = task->nsproxy->mnt_ns;
     smith_put_task_struct(task);
     put_pid(pid_struct);
 }
@@ -5571,6 +5812,9 @@ static int __init kprobe_hook_init(void)
     if (ret)
         return ret;
 
+    smith_init_systemd_ns();
+
+    /* need ROOT_MNT_NS inited by smith_init_systemd_ns */
     ret = smith_tid_init();
     if (ret)
         return ret;
@@ -5587,7 +5831,6 @@ static int __init kprobe_hook_init(void)
     exit_protect_action();
 #endif
 
-    __init_root_pid_ns_inum();
     install_kprobe();
     smith_nf_init();
 
